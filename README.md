@@ -21,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8783547450:AAF5k94P1Q6Jv7gK8b5gfMGv5fMZQTy3yIQ")
-GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", -1003906994235))
+GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", -1003667867938))
 
 # ===== КЛАВИАТУРА МЕНЮ ПОЛЬЗОВАТЕЛЯ =====
 MENU_BUTTONS = [
@@ -42,30 +42,24 @@ def get_main_menu():
     return ReplyKeyboardMarkup(MENU_BUTTONS, resize_keyboard=True)
 
 # ===== ХРАНИЛИЩА ЗАЯВОК =====
-# ключ: (chat_id, msg_id) -> dict с данными и статусом
 requests_db = {}
-# активные заявки: user_id -> (chat_id, msg_id)
 active_requests = {}
-# закрытые заявки: user_id -> (chat_id, msg_id)
 closed_requests = {}
 
 # ===== СОСТОЯНИЯ ДИАЛОГА =====
 WAITING_NICK = 1
 WAITING_ISSUE = 2
 
-# ===== ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: ЗАКРЫТИЕ ЗАЯВКИ =====
+# ===== ФУНКЦИЯ ЗАКРЫТИЯ ЗАЯВКИ =====
 async def close_request(key, context: ContextTypes.DEFAULT_TYPE, by_moderator: bool = True):
-    """Закрывает заявку, удаляет из активных, уведомляет пользователя."""
     data = requests_db.get(key)
     if not data or data["status"] != "open":
         return False
     data["status"] = "closed"
     user_id = data["user_id"]
-    # переносим в закрытые
     closed_requests[user_id] = key
     if user_id in active_requests and active_requests[user_id] == key:
         del active_requests[user_id]
-    # уведомляем пользователя
     try:
         await context.bot.send_message(
             chat_id=user_id,
@@ -85,13 +79,6 @@ async def send_to_group(user_id: int, category: str, nick: str, issue: str, cont
         f"<b>User ID:</b> <code>{user_id}</code>\n"
         f"<b>Суть обращения:</b>\n{issue}"
     )
-    # Inline-кнопка для закрытия (callback_data содержит user_id и message_id после отправки)
-    # Но message_id мы пока не знаем, поэтому используем уникальный идентификатор запроса.
-    # Проще: в callback_data закодировать будущий msg_id? Нельзя. Используем временный ключ из user_id + категории.
-    # Лучше: отправить сообщение, получить msg_id и потом редактировать клавиатуру.
-    # Но проще: сгенерировать уникальный request_id и хранить его в словаре, а в callback привязываться к нему.
-    # Я сделаю: отправляю без клавиатуры, получаю message_id, потом add inline keyboard с callback_data = f"close_{msg_id}".
-
     try:
         msg = await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=text, parse_mode="HTML")
         key = (GROUP_CHAT_ID, msg.message_id)
@@ -104,7 +91,7 @@ async def send_to_group(user_id: int, category: str, nick: str, issue: str, cont
         }
         active_requests[user_id] = key
 
-        # добавляем клавиатуру с кнопкой закрытия
+        # Добавляем кнопку закрытия
         keyboard = [[InlineKeyboardButton("🔒 Закрыть заявку", callback_data=f"close_{msg.message_id}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await msg.edit_reply_markup(reply_markup)
@@ -148,7 +135,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "У вас пока нет заявок."
     await update.message.reply_text(text, parse_mode="HTML")
 
-# ===== ОБРАБОТЧИК НАЧАЛА ДИАЛОГА (КНОПКА КАТЕГОРИИ) =====
+# ===== НАЧАЛО ДИАЛОГА (КНОПКА КАТЕГОРИИ) =====
 async def category_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     if user_id in active_requests:
@@ -199,9 +186,8 @@ async def issue_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_data.clear()
     return ConversationHandler.END
 
-# ===== ОБРАБОТЧИК ОТВЕТОВ МОДЕРАТОРА В ГРУППЕ =====
+# ===== ОБРАБОТЧИК ОТВЕТА МОДЕРАТОРА В ГРУППЕ =====
 async def group_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ответ модератора реплаем на сообщение бота: пересылаем пользователю и закрываем заявку."""
     if update.effective_chat.id != GROUP_CHAT_ID:
         return
     message = update.message
@@ -219,26 +205,22 @@ async def group_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = data["user_id"]
-    # Пересылаем ответ
     try:
         await context.bot.copy_message(
             chat_id=user_id,
             from_chat_id=GROUP_CHAT_ID,
             message_id=message.message_id,
         )
-        # Закрываем заявку (автоматически после ответа)
         await close_request(key, context, by_moderator=True)
         await message.reply_text("✅ Ответ отправлен, заявка закрыта.", quote=False)
     except Exception as e:
         logger.error(f"Ошибка пересылки ответа: {e}")
         await message.reply_text(f"❌ Ошибка: {e}", quote=False)
 
-# ===== ОБРАБОТЧИК НАЖАТИЯ КНОПКИ "ЗАКРЫТЬ ЗАЯВКУ" =====
+# ===== ОБРАБОТЧИК КНОПКИ "ЗАКРЫТЬ ЗАЯВКУ" =====
 async def close_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Модератор нажал кнопку 'Закрыть заявку'."""
     query = update.callback_query
     await query.answer()
-    # callback_data = "close_{message_id}"
     data_str = query.data
     if not data_str.startswith("close_"):
         return
@@ -252,10 +234,8 @@ async def close_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text="❌ Заявка не найдена.")
         return
 
-    # Закрываем заявку
     success = await close_request(key, context, by_moderator=True)
     if success:
-        # Редактируем сообщение в группе, убираем кнопку
         await query.edit_message_reply_markup(reply_markup=None)
         await query.edit_message_text(
             text=query.message.text + "\n\n🔒 <b>Заявка закрыта модератором.</b>",
@@ -279,7 +259,6 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
 
-    # Conversation handler для сбора заявки
     conv_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Text(CATEGORY_TEXTS), category_button)
@@ -292,25 +271,15 @@ def main():
         allow_reentry=True,
     )
 
-    # Регистрируем обработчики
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status_command))
-
-    # Обработчик ответов в группе (реплай на сообщения бота)
-    app.add_handler(MessageHandler(
-        filters.Chat(GROUP_CHAT_ID) & filters.REPLY,
-        group_reply
-    ))
-
-    # Обработчик inline-кнопки "Закрыть заявку"
+    app.add_handler(MessageHandler(filters.Chat(GROUP_CHAT_ID) & filters.REPLY, group_reply))
     app.add_handler(CallbackQueryHandler(close_button, pattern="^close_"))
-
-    # Неизвестные команды и простые сообщения
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(MessageHandler(filters.TEXT, unknown_text))
 
-    logger.info("🤖 Бот запущен с поддержкой закрытия заявок вручную.")
+    logger.info("🤖 Бот запущен и готов к работе.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
