@@ -50,8 +50,9 @@ closed_requests = {}
 WAITING_NICK = 1
 WAITING_ISSUE = 2
 
-# ===== ФУНКЦИЯ ЗАКРЫТИЯ ЗАЯВКИ =====
-async def close_request(key, context: ContextTypes.DEFAULT_TYPE, by_moderator: bool = True):
+# ===== ФУНКЦИЯ ЗАКРЫТИЯ ЗАЯВКИ (только по кнопке) =====
+async def close_request(key, context: ContextTypes.DEFAULT_TYPE):
+    """Закрывает заявку, уведомляет пользователя."""
     data = requests_db.get(key)
     if not data or data["status"] != "open":
         return False
@@ -91,7 +92,7 @@ async def send_to_group(user_id: int, category: str, nick: str, issue: str, cont
         }
         active_requests[user_id] = key
 
-        # Добавляем кнопку закрытия
+        # Добавляем кнопку «Закрыть заявку»
         keyboard = [[InlineKeyboardButton("🔒 Закрыть заявку", callback_data=f"close_{msg.message_id}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await msg.edit_reply_markup(reply_markup)
@@ -186,8 +187,12 @@ async def issue_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_data.clear()
     return ConversationHandler.END
 
-# ===== ОБРАБОТЧИК ОТВЕТА МОДЕРАТОРА В ГРУППЕ =====
+# ===== ОБРАБОТЧИК ОТВЕТА МОДЕРАТОРА В ГРУППЕ (БЕЗ ЗАКРЫТИЯ ЗАЯВКИ) =====
 async def group_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Отправляет ответ пользователю, но НЕ закрывает заявку.
+    Заявка закрывается только при нажатии кнопки «Закрыть заявку».
+    """
     if update.effective_chat.id != GROUP_CHAT_ID:
         return
     message = update.message
@@ -206,18 +211,19 @@ async def group_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = data["user_id"]
     try:
+        # Просто пересылаем ответ пользователю, статус заявки не меняем
         await context.bot.copy_message(
             chat_id=user_id,
             from_chat_id=GROUP_CHAT_ID,
             message_id=message.message_id,
         )
-        await close_request(key, context, by_moderator=True)
-        await message.reply_text("✅ Ответ отправлен, заявка закрыта.", quote=False)
+        await message.reply_text("✅ Ответ отправлен пользователю.", quote=False)
+        logger.info(f"Ответ на заявку {original_msg_id} отправлен пользователю {user_id}")
     except Exception as e:
         logger.error(f"Ошибка пересылки ответа: {e}")
         await message.reply_text(f"❌ Ошибка: {e}", quote=False)
 
-# ===== ОБРАБОТЧИК КНОПКИ "ЗАКРЫТЬ ЗАЯВКУ" =====
+# ===== ОБРАБОТЧИК КНОПКИ «ЗАКРЫТЬ ЗАЯВКУ» =====
 async def close_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -234,8 +240,9 @@ async def close_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text="❌ Заявка не найдена.")
         return
 
-    success = await close_request(key, context, by_moderator=True)
+    success = await close_request(key, context)
     if success:
+        # Убираем кнопку и показываем, что заявка закрыта
         await query.edit_message_reply_markup(reply_markup=None)
         await query.edit_message_text(
             text=query.message.text + "\n\n🔒 <b>Заявка закрыта модератором.</b>",
