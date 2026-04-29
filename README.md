@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8783547450:AAF5k94P1Q6Jv7gK8b5gfMGv5fMZQTy3yIQ")
 GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", -1003667867938))
 
-# ===== КЛАВИАТУРА МЕНЮ ПОЛЬЗОВАТЕЛЯ =====
+# ===== КЛАВИАТУРА МЕНЮ =====
 MENU_BUTTONS = [
     ["📢 Жалоба", "⚠️ Проблема"],
     ["❓ Вопрос", "🎓 Апелляция"],
@@ -42,17 +42,16 @@ def get_main_menu():
     return ReplyKeyboardMarkup(MENU_BUTTONS, resize_keyboard=True)
 
 # ===== ХРАНИЛИЩА ЗАЯВОК =====
-requests_db = {}
-active_requests = {}
-closed_requests = {}
+requests_db = {}          # ключ: (chat_id, msg_id) -> dict
+active_requests = {}      # user_id -> ключ заявки
+closed_requests = {}      # user_id -> ключ последней закрытой
 
 # ===== СОСТОЯНИЯ ДИАЛОГА =====
 WAITING_NICK = 1
 WAITING_ISSUE = 2
 
-# ===== ФУНКЦИЯ ЗАКРЫТИЯ ЗАЯВКИ (только по кнопке) =====
+# ===== ЗАКРЫТИЕ ЗАЯВКИ (ТОЛЬКО ПО КНОПКЕ) =====
 async def close_request(key, context: ContextTypes.DEFAULT_TYPE):
-    """Закрывает заявку, уведомляет пользователя."""
     data = requests_db.get(key)
     if not data or data["status"] != "open":
         return False
@@ -72,7 +71,7 @@ async def close_request(key, context: ContextTypes.DEFAULT_TYPE):
     return True
 
 # ===== ОТПРАВКА ЗАЯВКИ В ГРУППУ =====
-async def send_to_group(user_id: int, category: str, nick: str, issue: str, context: ContextTypes.DEFAULT_TYPE):
+async def send_to_group(user_id, category, nick, issue, context):
     text = (
         f"📩 <b>Новая заявка</b>\n"
         f"<b>Категория:</b> {category}\n"
@@ -91,13 +90,10 @@ async def send_to_group(user_id: int, category: str, nick: str, issue: str, cont
             "status": "open"
         }
         active_requests[user_id] = key
-
-        # Добавляем кнопку «Закрыть заявку»
+        # Кнопка закрытия
         keyboard = [[InlineKeyboardButton("🔒 Закрыть заявку", callback_data=f"close_{msg.message_id}")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await msg.edit_reply_markup(reply_markup)
-
-        logger.info(f"Заявка от user_id={user_id} отправлена в группу, msg_id={msg.message_id}")
+        await msg.edit_reply_markup(InlineKeyboardMarkup(keyboard))
+        logger.info(f"Заявка {msg.message_id} от user_id={user_id} создана")
         return True, key
     except Exception as e:
         logger.error(f"Ошибка отправки в группу: {e}")
@@ -117,7 +113,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = requests_db[key]
         text = (
             f"📋 <b>Статус вашей заявки</b>\n"
-            f"<b>Статус:</b> 🟡 Открыта (ожидает ответа)\n"
+            f"<b>Статус:</b> 🟡 Открыта\n"
             f"<b>Категория:</b> {data['category']}\n"
             f"<b>Ник:</b> {data['nick']}\n"
             f"<b>Суть:</b> {data['issue']}"
@@ -136,7 +132,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "У вас пока нет заявок."
     await update.message.reply_text(text, parse_mode="HTML")
 
-# ===== НАЧАЛО ДИАЛОГА (КНОПКА КАТЕГОРИИ) =====
+# ===== ДИАЛОГ СОЗДАНИЯ ЗАЯВКИ =====
 async def category_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     if user_id in active_requests:
@@ -150,7 +146,6 @@ async def category_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     text = update.message.text
     category = BUTTON_TO_CATEGORY.get(text, text)
     context.user_data["category"] = category
-    logger.info(f"Пользователь {user_id} выбрал категорию: {category}")
     await update.message.reply_text(
         f"📌 Категория: <b>{category}</b>\n\nВведите ваш ник (или @username):",
         parse_mode="HTML",
@@ -161,7 +156,6 @@ async def category_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def nick_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     nick = update.message.text.strip()
     context.user_data["nick"] = nick
-    logger.info(f"Пользователь {update.effective_user.id} ввёл ник: {nick}")
     await update.message.reply_text("Теперь подробно опишите суть обращения:")
     return WAITING_ISSUE
 
@@ -176,7 +170,7 @@ async def issue_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if success:
         await update.message.reply_text(
             "✅ Ваша заявка успешно создана! Ожидайте ответа.\n"
-            "Статус можно проверить командой /status",
+            "Статус: /status",
             reply_markup=get_main_menu()
         )
     else:
@@ -187,31 +181,29 @@ async def issue_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_data.clear()
     return ConversationHandler.END
 
-# ===== ОБРАБОТЧИК ОТВЕТА МОДЕРАТОРА В ГРУППЕ (БЕЗ ЗАКРЫТИЯ ЗАЯВКИ) =====
+# ===== ОТВЕТ МОДЕРАТОРА В ГРУППЕ =====
 async def group_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Отправляет ответ пользователю, но НЕ закрывает заявку.
-    Заявка закрывается только при нажатии кнопки «Закрыть заявку».
-    """
+    """Модератор отвечает на заявку реплаем -> префикс + копия пользователю."""
     if update.effective_chat.id != GROUP_CHAT_ID:
         return
     message = update.message
-    if not message.reply_to_message:
-        return
-    if message.reply_to_message.from_user.id != context.bot.id:
+    if not message.reply_to_message or message.reply_to_message.from_user.id != context.bot.id:
         return
 
     original_msg_id = message.reply_to_message.message_id
     key = (GROUP_CHAT_ID, original_msg_id)
     data = requests_db.get(key)
-
     if not data:
         logger.warning(f"Заявка для msg_id={original_msg_id} не найдена")
         return
 
     user_id = data["user_id"]
     try:
-        # Просто пересылаем ответ пользователю, статус заявки не меняем
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="👨‍💻 <b>Команда поддержки:</b>",
+            parse_mode="HTML"
+        )
         await context.bot.copy_message(
             chat_id=user_id,
             from_chat_id=GROUP_CHAT_ID,
@@ -223,26 +215,58 @@ async def group_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка пересылки ответа: {e}")
         await message.reply_text(f"❌ Ошибка: {e}", quote=False)
 
-# ===== ОБРАБОТЧИК КНОПКИ «ЗАКРЫТЬ ЗАЯВКУ» =====
+# ===== ОТВЕТ ПОЛЬЗОВАТЕЛЯ В ЛИЧКЕ =====
+async def user_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пользователь отвечает на сообщение бота -> пересылается в группу."""
+    if update.effective_chat.type != "private":
+        return
+    message = update.message
+    if not message.reply_to_message or message.reply_to_message.from_user.id != context.bot.id:
+        return
+
+    user_id = update.effective_user.id
+    if user_id not in active_requests:
+        await message.reply_text("У вас нет открытых заявок для ответа.")
+        return
+
+    key = active_requests[user_id]
+    original_msg_id = key[1]
+    try:
+        # Уведомление в группе
+        await context.bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text=f"📩 <b>Ответ пользователя</b> (ID <code>{user_id}</code>):",
+            parse_mode="HTML",
+            reply_to_message_id=original_msg_id,
+        )
+        # Само сообщение пользователя
+        await context.bot.copy_message(
+            chat_id=GROUP_CHAT_ID,
+            from_chat_id=user_id,
+            message_id=message.message_id,
+            reply_to_message_id=original_msg_id,
+        )
+        logger.info(f"Ответ пользователя {user_id} переслан в группу к заявке {original_msg_id}")
+    except Exception as e:
+        logger.error(f"Ошибка пересылки ответа пользователя: {e}")
+        await message.reply_text("❌ Не удалось отправить ответ.")
+
+# ===== КНОПКА ЗАКРЫТИЯ ЗАЯВКИ =====
 async def close_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data_str = query.data
-    if not data_str.startswith("close_"):
+    if not query.data.startswith("close_"):
         return
     try:
-        msg_id = int(data_str.split("_")[1])
+        msg_id = int(query.data.split("_")[1])
     except (IndexError, ValueError):
         return
-
     key = (GROUP_CHAT_ID, msg_id)
     if key not in requests_db:
-        await query.edit_message_text(text="❌ Заявка не найдена.")
+        await query.edit_message_text("❌ Заявка не найдена.")
         return
-
     success = await close_request(key, context)
     if success:
-        # Убираем кнопку и показываем, что заявка закрыта
         await query.edit_message_reply_markup(reply_markup=None)
         await query.edit_message_text(
             text=query.message.text + "\n\n🔒 <b>Заявка закрыта модератором.</b>",
@@ -250,7 +274,7 @@ async def close_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=None
         )
     else:
-        await query.edit_message_text(text="❌ Не удалось закрыть заявку.")
+        await query.edit_message_text("❌ Не удалось закрыть заявку.")
 
 # ===== ПРОЧИЕ СООБЩЕНИЯ =====
 async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -267,9 +291,7 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Text(CATEGORY_TEXTS), category_button)
-        ],
+        entry_points=[MessageHandler(filters.Text(CATEGORY_TEXTS), category_button)],
         states={
             WAITING_NICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, nick_received)],
             WAITING_ISSUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, issue_received)],
@@ -281,12 +303,18 @@ def main():
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status_command))
+
+    # Ответы в группе (реплай на сообщения бота)
     app.add_handler(MessageHandler(filters.Chat(GROUP_CHAT_ID) & filters.REPLY, group_reply))
+
+    # Ответы пользователей в личке (реплай на сообщения бота) – приоритет над обычным текстом
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.REPLY, user_reply))
+
     app.add_handler(CallbackQueryHandler(close_button, pattern="^close_"))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(MessageHandler(filters.TEXT, unknown_text))
 
-    logger.info("🤖 Бот запущен и готов к работе.")
+    logger.info("🤖 Бот запущен с поддержкой диалога и уведомлениями «Команда поддержки».")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
